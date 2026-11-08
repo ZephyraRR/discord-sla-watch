@@ -30,7 +30,7 @@ for minute in range(0, 6 * 60 + 1):
         else:
             tr.close_ticket(tid, now)
     for a in tr.check(now):
-        print(f"  +{minute:3d} min  {a.ticket_id}: {a.kind} breached after {int(a.waited.total_seconds() // 60)} min")
+        print(f"  +{minute:3d} min  {a.ticket_id}: {a.kind} after {int(a.waited.total_seconds() // 60)} min")
 
 print()
 print(format_report(tr.report()))

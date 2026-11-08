@@ -87,3 +87,74 @@ def test_messages_on_unknown_or_closed_tickets_are_ignored():
     t.close_ticket("a", T0 + timedelta(minutes=1))
     t.message("a", "s", True, T0 + timedelta(minutes=2))
     assert t.tickets["a"].first_staff_response_at is None
+
+
+# --- regression tests for problems found in review ------------------------------------------------------------------------
+from sla_watch import Store
+
+
+def test_warning_comes_before_the_breach_and_only_once():
+    t = tracker()
+    t.open_ticket("a", "c", T0)
+    warn = t.check(T0 + timedelta(minutes=13))            # 80% of 15 min = 12 min
+    again = t.check(T0 + timedelta(minutes=14))
+    breach = t.check(T0 + timedelta(minutes=16))
+    assert [a.kind for a in warn] == ["first_response_warn"] and again == []
+    assert [a.kind for a in breach] == ["first_response"]
+    assert warn[0].is_warning and not breach[0].is_warning
+
+
+def test_a_breach_without_an_earlier_check_does_not_also_send_a_stale_warning():
+    t = tracker()
+    t.open_ticket("a", "c", T0)
+    assert [a.kind for a in t.check(T0 + timedelta(minutes=20))] == ["first_response"]
+
+
+def test_warnings_can_be_switched_off():
+    t = Tracker(SLAConfig(first_response=timedelta(minutes=15), resolution=timedelta(hours=4), warn_at=0))
+    t.open_ticket("a", "c", T0)
+    assert t.check(T0 + timedelta(minutes=14)) == []
+
+
+def test_naive_datetimes_do_not_crash():
+    t = tracker()
+    t.open_ticket("a", "c", datetime(2026, 11, 2, 9, 0))                 # naive
+    assert [a.kind for a in t.check(T0 + timedelta(minutes=20))] == ["first_response"]
+
+
+def test_a_staff_member_who_opened_the_ticket_is_not_a_first_response():
+    t = tracker()
+    t.open_ticket("a", "ana", T0)
+    t.message("a", "ana", True, T0 + timedelta(minutes=1))
+    assert t.tickets["a"].first_staff_response_at is None
+
+
+def test_the_first_customer_message_sets_the_opener():
+    t = tracker()
+    t.open_ticket("a", "", T0)
+    t.message("a", "customer", False, T0 + timedelta(minutes=1))
+    t.message("a", "customer", True, T0 + timedelta(minutes=2))        # same id as the opener: not an answer
+    assert t.tickets["a"].opener_id == "customer" and t.tickets["a"].first_staff_response_at is None
+
+
+def test_reopening_restarts_the_first_response_clock():
+    t = tracker()
+    t.open_ticket("a", "c", T0)
+    t.message("a", "s", True, T0 + timedelta(minutes=2))
+    t.close_ticket("a", T0 + timedelta(minutes=10))
+    t.reopen_ticket("a")
+    tk = t.tickets["a"]
+    assert tk.closed_at is None and tk.first_staff_response_at is None and tk.alerted == ""
+
+
+def test_state_survives_a_restart_and_alerts_are_not_repeated(tmp_path):
+    path = str(tmp_path / "sla.sqlite3")
+    t1 = Tracker(SLAConfig(first_response=timedelta(minutes=15), resolution=timedelta(hours=4)), Store(path))
+    t1.open_ticket("a", "c", T0)
+    assert [a.kind for a in t1.check(T0 + timedelta(minutes=16))] == ["first_response"]
+    t2 = Tracker(SLAConfig(first_response=timedelta(minutes=15), resolution=timedelta(hours=4)), Store(path))   # "restart"
+    assert "a" in t2.tickets
+    assert t2.check(T0 + timedelta(minutes=17)) == []                                                            # already alerted before the restart
+    t2.message("a", "ana", True, T0 + timedelta(minutes=18))
+    t3 = Tracker(SLAConfig(), Store(path))
+    assert t3.tickets["a"].first_staff_id == "ana"

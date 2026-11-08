@@ -1,11 +1,12 @@
 """SLA tracking core for support tickets. No Discord code in here, so it is easy to test and to reuse with other ticket systems.
 
 A ticket has an opening time, messages from the customer and from staff, and an optional closing time.
-Two clocks matter: time to first staff response, and time to resolution.
+Two clocks matter: time to first staff response, and time to resolution. Each one can raise a warning (default: at 80% of the limit)
+before it raises a breach alert, so staff can still save the SLA.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
@@ -14,10 +15,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def aware(dt: datetime | None) -> datetime | None:
+    """Naive datetimes are treated as UTC, so mixing them with aware ones cannot raise TypeError."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 @dataclass
 class SLAConfig:
     first_response: timedelta = timedelta(minutes=15)
     resolution: timedelta = timedelta(hours=24)
+    warn_at: float = 0.8            # fraction of the limit at which a warning is raised; 0 or 1 disables warnings
     # Optional business hours in UTC, for example (8, 18) for 08:00 to 18:00 on weekdays. None = the clock never stops.
     business_hours: tuple[int, int] | None = None
 
@@ -30,21 +39,25 @@ class Ticket:
     first_staff_response_at: datetime | None = None
     first_staff_id: str = ""
     closed_at: datetime | None = None
-    alerted_first_response: bool = False
-    alerted_resolution: bool = False
     messages: int = 0
+    alerted: str = ""               # comma separated: first_response_warn, first_response, resolution_warn, resolution
 
 
 @dataclass
 class Alert:
     ticket_id: str
-    kind: str          # "first_response" or "resolution"
+    kind: str          # first_response, first_response_warn, resolution, resolution_warn
     waited: timedelta
     limit: timedelta
+
+    @property
+    def is_warning(self) -> bool:
+        return self.kind.endswith("_warn")
 
 
 def working_time(start: datetime, end: datetime, hours: tuple[int, int] | None) -> timedelta:
     """Elapsed time that counts against the SLA. Without business hours this is simply end - start."""
+    start, end = aware(start), aware(end)
     if end <= start:
         return timedelta(0)
     if hours is None:
@@ -63,54 +76,90 @@ def working_time(start: datetime, end: datetime, hours: tuple[int, int] | None) 
 
 
 class Tracker:
-    def __init__(self, config: SLAConfig | None = None):
+    def __init__(self, config: SLAConfig | None = None, store=None):
         self.config = config or SLAConfig()
+        self.store = store
         self.tickets: dict[str, Ticket] = {}
+        if store is not None:
+            self.tickets = {t.ticket_id: t for t in store.load_all()}
+
+    def _save(self, t: Ticket) -> None:
+        if self.store is not None:
+            self.store.upsert(t)
 
     # events -----------------------------------------------------------------
     def open_ticket(self, ticket_id: str, opener_id: str = "", at: datetime | None = None) -> Ticket:
         t = self.tickets.get(ticket_id)
         if t is None:
-            t = Ticket(ticket_id=ticket_id, opened_at=at or utcnow(), opener_id=opener_id)
+            t = Ticket(ticket_id=ticket_id, opened_at=aware(at) or utcnow(), opener_id=opener_id)
             self.tickets[ticket_id] = t
+            self._save(t)
         return t
 
     def message(self, ticket_id: str, author_id: str, is_staff: bool, at: datetime | None = None) -> None:
         t = self.tickets.get(ticket_id)
-        if t is None or t.closed_at is not None:
+        if t is None:
+            return
+        if t.closed_at is not None:
             return
         t.messages += 1
-        if is_staff and t.first_staff_response_at is None:
-            t.first_staff_response_at = at or utcnow()
+        if not t.opener_id and not is_staff:
+            t.opener_id = author_id                       # the first customer message tells us who opened the ticket
+        # a staff member who opened the ticket themselves (a test, a follow-up) is not answering a customer
+        if is_staff and t.first_staff_response_at is None and author_id != t.opener_id:
+            t.first_staff_response_at = aware(at) or utcnow()
             t.first_staff_id = author_id
+        self._save(t)
 
     def close_ticket(self, ticket_id: str, at: datetime | None = None) -> None:
         t = self.tickets.get(ticket_id)
         if t is not None and t.closed_at is None:
-            t.closed_at = at or utcnow()
+            t.closed_at = aware(at) or utcnow()
+            self._save(t)
+
+    def reopen_ticket(self, ticket_id: str) -> None:
+        """A closed ticket that gets a new customer message is a new wait: the first response clock restarts from now and old alerts are cleared."""
+        t = self.tickets.get(ticket_id)
+        if t is not None and t.closed_at is not None:
+            t.closed_at = None
+            t.first_staff_response_at = None
+            t.first_staff_id = ""
+            t.opened_at = utcnow()
+            t.alerted = ""
+            self._save(t)
 
     # checks -----------------------------------------------------------------
     def check(self, now: datetime | None = None) -> list[Alert]:
-        """Return each breach once. Call it every minute."""
-        now = now or utcnow()
+        """Return each warning and breach once. Call it every minute."""
+        now = aware(now) or utcnow()
+        cfg = self.config
         out: list[Alert] = []
         for t in self.tickets.values():
             if t.closed_at is not None:
                 continue
-            if t.first_staff_response_at is None and not t.alerted_first_response:
-                waited = working_time(t.opened_at, now, self.config.business_hours)
-                if waited > self.config.first_response:
-                    t.alerted_first_response = True
-                    out.append(Alert(t.ticket_id, "first_response", waited, self.config.first_response))
-            if not t.alerted_resolution:
-                waited = working_time(t.opened_at, now, self.config.business_hours)
-                if waited > self.config.resolution:
-                    t.alerted_resolution = True
-                    out.append(Alert(t.ticket_id, "resolution", waited, self.config.resolution))
+            done = set(filter(None, t.alerted.split(",")))
+            waited = working_time(t.opened_at, now, cfg.business_hours)
+            checks = []
+            if t.first_staff_response_at is None:
+                checks.append(("first_response", cfg.first_response))
+            checks.append(("resolution", cfg.resolution))
+            for kind, limit in checks:
+                if waited > limit and kind not in done:
+                    done.add(kind)
+                    done.add(kind + "_warn")           # a breach makes the earlier warning pointless
+                    out.append(Alert(t.ticket_id, kind, waited, limit))
+                elif 0 < cfg.warn_at < 1 and waited > limit * cfg.warn_at and waited <= limit and kind + "_warn" not in done:
+                    done.add(kind + "_warn")
+                    out.append(Alert(t.ticket_id, kind + "_warn", waited, limit))
+            new = ",".join(sorted(done))
+            if new != t.alerted:
+                t.alerted = new
+                self._save(t)
         return out
 
     # reporting --------------------------------------------------------------
     def report(self, since: datetime | None = None) -> dict:
+        since = aware(since)
         rows = [t for t in self.tickets.values() if since is None or t.opened_at >= since]
         frt = [working_time(t.opened_at, t.first_staff_response_at, self.config.business_hours) for t in rows if t.first_staff_response_at]
         res = [working_time(t.opened_at, t.closed_at, self.config.business_hours) for t in rows if t.closed_at]

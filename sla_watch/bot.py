@@ -9,6 +9,7 @@ import os
 from datetime import timedelta
 
 from .core import SLAConfig, Tracker, format_report
+from .store import Store
 
 try:
     import discord
@@ -20,6 +21,7 @@ except ImportError:  # the core and the tests work without discord.py
 def load_config() -> tuple[SLAConfig, dict]:
     cfg = SLAConfig(
         first_response=timedelta(minutes=float(os.environ.get("SLA_FIRST_RESPONSE_MIN", "15"))),
+        warn_at=float(os.environ.get("SLA_WARN_AT", "0.8")),
         resolution=timedelta(hours=float(os.environ.get("SLA_RESOLUTION_HOURS", "24"))),
     )
     bh = os.environ.get("SLA_BUSINESS_HOURS")          # "8-18"
@@ -40,7 +42,7 @@ def run() -> None:
     if discord is None:
         raise SystemExit("pip install discord.py to run the bot")
     cfg, env = load_config()
-    tracker = Tracker(cfg)
+    tracker = Tracker(cfg, Store(os.environ.get("SLA_DB", "sla_watch.sqlite3")))   # survives restarts
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guilds = True
@@ -70,7 +72,9 @@ def run() -> None:
         if message.author.bot or not is_ticket(message.channel):
             return
         is_staff = any(r.id == env["staff_role"] for r in getattr(message.author, "roles", []))
-        tracker.open_ticket(str(message.channel.id), str(message.author.id), message.channel.created_at)   # also covers tickets that existed before the bot started
+        tracker.open_ticket(str(message.channel.id), "", message.channel.created_at)   # also covers tickets that existed before the bot started
+        if not is_staff:
+            tracker.reopen_ticket(str(message.channel.id))                              # a customer writes again in a closed ticket: new wait
         tracker.message(str(message.channel.id), str(message.author.id), is_staff, message.created_at)
         if message.content.strip() == "!sla":
             await message.channel.send("```\n" + format_report(tracker.report()) + "\n```")
@@ -79,10 +83,11 @@ def run() -> None:
     async def watchdog():
         channel = client.get_channel(env["alert_channel"])
         for a in tracker.check():
-            label = "first response" if a.kind == "first_response" else "resolution"
+            label = "first response" if a.kind.startswith("first_response") else "resolution"
             minutes = int(a.waited.total_seconds() // 60)
+            head = "SLA warning" if a.is_warning else "SLA breach"
             if channel:
-                await channel.send(f"SLA breach ({label}): <#{a.ticket_id}> waited {minutes} min, limit {int(a.limit.total_seconds() // 60)} min.")
+                await channel.send(f"{head} ({label}): <#{a.ticket_id}> has waited {minutes} min, limit {int(a.limit.total_seconds() // 60)} min.")
 
     @client.event
     async def on_ready():
